@@ -142,6 +142,7 @@ class WelcomeScreen extends StatelessWidget {
                 // Social media buttons
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     _SocialButton(
                       backgroundColor: Colors.cyan.shade700,

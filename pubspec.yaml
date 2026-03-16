@@ -9,6 +9,10 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_local_notifications: ^17.0.0
+  google_mlkit_face_detection: ^0.11.0
+  file_picker: ^8.0.0
+  shared_preferences: ^2.0.0
 
   # UI
   cupertino_icons: ^1.0.8
@@ -64,6 +68,7 @@ dependencies:
   url_launcher: ^6.3.1
   telephony_sms: ^0.0.4
 
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -76,9 +81,11 @@ flutter:
     - assets/welcome.jpg
     - assets/welcome.png
     - assets/sign.png
-    - assets/model/eye_model.tflite
-    - assets/model/yawn_model.tflite
     - assets/alert_sound.mp3
+    - assets/alarm_beep.mp3
+    - assets/alarm_siren.mp3
+    - assets/alarm_horn.mp3
+    - assets/model/drowsiness_model_fp16.tflite
 
 flutter_icons:
   android: true

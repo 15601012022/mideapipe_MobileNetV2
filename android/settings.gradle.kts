@@ -1,4 +1,5 @@
 
+
 pluginManagement {
     val flutterSdkPath =
         run {
@@ -25,3 +26,4 @@ plugins {
 }
 
 include(":app")
+include(":wear")
