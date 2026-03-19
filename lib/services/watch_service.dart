@@ -58,21 +58,17 @@ class WatchService {
         'isDrowsy': isDrowsy,
         'earScore': earScore,
         'detectionCount': detectionCount,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
       });
-    } on PlatformException catch (e) {
-      print('WatchService sendAlert error: ${e.message}');
+    } catch (e) {
+      // Watch not connected — ignore silently
     }
   }
 
-  /// Send monitoring status update to watch
   Future<void> sendMonitoringStatus({required bool isActive}) async {
     try {
-      await _channel.invokeMethod('sendStatus', {
-        'isMonitoring': isActive,
-      });
-    } on PlatformException catch (e) {
-      print('WatchService sendStatus error: ${e.message}');
+      await _channel.invokeMethod('sendStatus', {'isMonitoring': isActive});
+    } catch (e) {
+      // Watch not connected — ignore silently
     }
   }
 

@@ -12,10 +12,11 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'ml_model_service.dart';
 import 'services/watch_service.dart';
-import 'services/face_detection_service.dart';
 import 'watch_screen.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'services/mediapipe_channel.dart';
+import 'services/fusion_service.dart';
 
 
 class HomePage extends StatefulWidget {
@@ -24,18 +25,21 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+// ← WidgetsBindingObserver added for lifecycle handling
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ── Alert state ───────────────────────────────────────────
   Timer? _vibrationTimer;
   Timer? _alertDelayTimer;
   Timer? _deepSleepTimer;
   Timer? _deepSleepSmsTimer;
-  Timer? _drowsyWallClockTimer;   // WALL CLOCK timer — not frame-based
+  Timer? _drowsyWallClockTimer;
+  bool _isDisposed = false;
   bool  _isAlertDialogOpen = false;
   bool  _isAlertPending    = false;
+  bool  _isAlertShowing = false;
   bool  _isDeepSleepMode   = false;
-  bool  _isInferenceRunning = false; // GUARD: prevent overlapping inference
+  bool  _isInferenceRunning = false;
   int   _consecutiveDrowsyFrames = 0;
   int   _continuousDrowsySeconds = 0;
   int   _alertToleranceFrames    = 0;
@@ -43,9 +47,10 @@ class _HomePageState extends State<HomePage> {
 
   // ── Services ──────────────────────────────────────────────
   final MLModelService        _mlModelService       = MLModelService();
-  final FaceDetectionService  _faceDetectionService = FaceDetectionService();
+  final MediaPipeChannel      _mediaPipe            = MediaPipeChannel();
+  final FusionService         _fusionService        = FusionService();
   final WatchService          _watchService         = WatchService();
-  final AudioPlayer           _audioPlayer          = AudioPlayer();
+  AudioPlayer _audioPlayer = AudioPlayer();
   final FirebaseAuth          _auth                 = FirebaseAuth.instance;
   final FirebaseFirestore     _firestore            = FirebaseFirestore.instance;
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
@@ -59,7 +64,6 @@ class _HomePageState extends State<HomePage> {
   bool _isModelLoading      = true;
 
   // ── Monitoring state ──────────────────────────────────────
-
   bool   _isMonitoring     = false;
   int    _detectionCount   = 0;
   String _currentStatus    = 'Initializing...';
@@ -71,9 +75,9 @@ class _HomePageState extends State<HomePage> {
   bool _isFaceDrowsy = false;
 
   // ── Settings ──────────────────────────────────────────────
-  bool _soundAlert         = true;
-  bool _vibrationAlert     = true;
-  bool _smsAlert           = false;
+  bool _soundAlert          = true;
+  bool _vibrationAlert      = true;
+  bool _smsAlert            = false;
   int  _drowsinessThreshold = 3;
 
   // ── Bluetooth ─────────────────────────────────────────────
@@ -89,12 +93,13 @@ class _HomePageState extends State<HomePage> {
   static const Color kOrange = Color(0xFFFFA726);
 
   // ══════════════════════════════════════════════════════════
-  // INIT
+  // INIT / DISPOSE / LIFECYCLE
   // ══════════════════════════════════════════════════════════
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // ← lifecycle observer
     _initializeApp();
   }
 
@@ -103,11 +108,14 @@ class _HomePageState extends State<HomePage> {
     await _loadUserSettings();
     await _initWatch();
     await _initNotifications();
-    await _faceDetectionService.initialize();
+    final mpReady = await _mediaPipe.isInitialized();
+    print('MediaPipe ready: $mpReady');
   }
 
   @override
   void dispose() {
+    _isDisposed = true;
+    WidgetsBinding.instance.removeObserver(this); // ← remove observer
     _watchCommandSub?.cancel();
     _cameraController?.dispose();
     _captureTimer?.cancel();
@@ -116,10 +124,41 @@ class _HomePageState extends State<HomePage> {
     _deepSleepSmsTimer?.cancel();
     _drowsyWallClockTimer?.cancel();
     _vibrationTimer?.cancel();
-    _audioPlayer.dispose();
-    _faceDetectionService.dispose();
+    _fusionService.reset();
     super.dispose();
   }
+
+  /// Handles app going to background / coming back to foreground.
+  /// Fixes the black screen after pressing "Stop Monitoring" or switching apps.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Only handle true background, never inactive (dialogs trigger inactive)
+    if (state != AppLifecycleState.paused &&
+        state != AppLifecycleState.resumed) return;
+
+    if (state == AppLifecycleState.paused) {
+      if (_isAlertShowing || _isAlertDialogOpen || _isDeepSleepMode) return;
+      _captureTimer?.cancel();
+      _isInferenceRunning = false;
+      _cameraController?.dispose();
+      _cameraController = null;
+      if (mounted) setState(() => _isCameraInitialized = false);
+
+    } else if (state == AppLifecycleState.resumed) {
+      if (!_isCameraInitialized) {
+        _initializeCamera().then((_) {
+          if (_isMonitoring && _isCameraInitialized) {
+            _captureTimer?.cancel();
+            _captureTimer = Timer.periodic(
+              const Duration(milliseconds: 1500),
+                  (_) => _captureAndRunInference(),
+            );
+          }
+        });
+      }
+    }
+  }
+
 
   // ══════════════════════════════════════════════════════════
   // NOTIFICATIONS + WATCH
@@ -209,7 +248,7 @@ class _HomePageState extends State<HomePage> {
       );
       _cameraController = CameraController(
         frontCamera, ResolutionPreset.medium,
-        enableAudio: false, imageFormatGroup: ImageFormatGroup.nv21,
+        enableAudio: false, imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await _cameraController!.initialize();
       if (mounted) setState(() {
@@ -222,126 +261,125 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ══════════════════════════════════════════════════════════
-  // DETECTION — SEQUENTIAL (FIX FOR SPEED)
+  // DETECTION
   // ══════════════════════════════════════════════════════════
 
   Future<void> _captureAndRunInference() async {
-    // GUARD: skip if previous inference still running
+    // Guard: skip if camera is gone or inference already running
     if (_isInferenceRunning || !_isCameraInitialized) return;
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+
     _isInferenceRunning = true;
 
     try {
       final XFile image = await _cameraController!.takePicture();
+      final Uint8List bytes = await File(image.path).readAsBytes();
 
-      // ── STEP 1: MediaPipe face detection (fast, ~100ms) ──
-      final faceResult = await _faceDetectionService.detectFromFile(image.path);
+      // STEP 2: MediaPipe face landmarks
+      final mpResult = await _mediaPipe.analyzeFrame(bytes);
 
-      // Update face box immediately after MediaPipe
-      final rawBox = faceResult['face_box'];
-      if (mounted) {
-        setState(() {
-          _faceBox = rawBox == null ? null : {
-            'left':   (rawBox['left']   as num).toDouble(),
-            'top':    (rawBox['top']    as num).toDouble(),
-            'right':  (rawBox['right']  as num).toDouble(),
-            'bottom': (rawBox['bottom'] as num).toDouble(),
-            'width':  (rawBox['width']  as num).toDouble(),
-            'height': (rawBox['height'] as num).toDouble(),
-          };
-        });
-      }
-
-      final mlkitDrowsy = faceResult['is_drowsy'] as bool;
-      final eyeClosed   = faceResult['eye_closed'] as bool;
-      final yawning     = faceResult['yawn_detected'] as bool;
-      final nodding     = faceResult['is_nodding'] as bool;
-      final earScore    = (faceResult['ear_score'] as num?)?.toDouble() ?? 1.0;
-
-
-      // ── STEP 2: MobileNetV2 — skip if MediaPipe already very confident ──
+      // STEP 3: MobileNetV2 model score
       double modelScore = 0.0;
       if (_isModelLoaded) {
-        final Uint8List bytes = await File(image.path).readAsBytes();
         final modelResult = await _mlModelService.runPrediction(
             _mlModelService.preprocessCameraFile(bytes));
         modelScore = (modelResult['drowsy_score'] as num?)?.toDouble() ?? 0.0;
       }
 
-      // ── COMBINED LOGIC ────────────────────────────────────
-      // MediaPipe is primary. Model confirms or catches missed cases.
-      bool isDrowsy = mlkitDrowsy || modelScore > 0.35;
+      // STEP 4: Fusion decision
+      final fusResult = _fusionService.evaluate(
+        ear:          mpResult.ear,
+        mar:          mpResult.mar,
+        pitch:        mpResult.pitch,
+        faceDetected: mpResult.faceDetected,
+        deepScore:    modelScore,
+      );
+      final bool isDrowsy = fusResult.isDrowsy;
 
-      print('👁 MLKit=$mlkitDrowsy (eye=$eyeClosed yawn=$yawning nod=$nodding) '
-          '| Model=${modelScore.toStringAsFixed(3)} | Final=$isDrowsy');
+      print('DEBUG: face=${mpResult.faceDetected} '
+          'EAR=${mpResult.ear.toStringAsFixed(3)} '
+          'MAR=${mpResult.mar.toStringAsFixed(3)} '
+          'model=${modelScore.toStringAsFixed(3)} '
+          'isDrowsy=$isDrowsy reason=${fusResult.reason}');
 
-      // ── WAKE UP: stop alerts immediately ─────────────────
-      if (!isDrowsy && (_isAlertPending || _isAlertDialogOpen)) {
-        _alertDelayTimer?.cancel();
-        _stopAllAlerts();
+      // STEP 5: Update face box overlay
+      if (mounted) {
         setState(() {
-          _drowsinessStatus = 'Normal';
-          _isFaceDrowsy     = false;
+          if (mpResult.faceDetected) {
+            _faceBox = {
+              'left':   mpResult.boxLeft,
+              'top':    mpResult.boxTop,
+              'right':  mpResult.boxRight,
+              'bottom': mpResult.boxBottom,
+            };
+          } else {
+            _faceBox = null;
+          }
         });
       }
 
-      // ── UPDATE UI ─────────────────────────────────────────
-      if (mounted) setState(() {
-        _isFaceDrowsy     = isDrowsy;
-        _drowsinessStatus = isDrowsy ? 'Drowsy Detected!' : 'Normal';
-        if (isDrowsy) _detectionCount++;
-      });
-
       _watchService.sendDrowsinessAlert(
-          isDrowsy: isDrowsy, earScore: earScore, detectionCount: _detectionCount);
+          isDrowsy: isDrowsy,
+          earScore: mpResult.ear,
+          detectionCount: _detectionCount);
 
-      // ── FRAME COUNTER + ALERTS ────────────────────────────────
       _warmupFrames++;
 
-      if (isDrowsy) {
-        _consecutiveDrowsyFrames++;
-        _alertToleranceFrames = 0;
-
-        // Skip first 3 frames — MediaPipe needs warmup
-        if (_consecutiveDrowsyFrames >= 1 && _warmupFrames > 3) {
-          _triggerAlerts();
-        }
-
-        // Start wall-clock drowsy timer if not already running
-        _startDrowsyWallClock();
-
-      } else {
+      // STEP 6: Frame counter + alert logic
+      // Single if/else — no duplicate blocks
+      if (!isDrowsy) {
         _consecutiveDrowsyFrames = 0;
         _alertToleranceFrames++;
 
+        // Require 3 consecutive alert frames before declaring truly alert
+        // This prevents one bright frame killing a drowsy streak
         if (_alertToleranceFrames >= 3) {
           _alertToleranceFrames = 0;
           _stopDrowsyWallClock();
           if (_isDeepSleepMode) _cancelDeepSleepAlarm();
           if (!_isAlertPending && mounted) {
-            setState(() { _isFaceDrowsy = false; _drowsinessStatus = 'Normal'; });
+            setState(() {
+              _isFaceDrowsy     = false;
+              _drowsinessStatus = 'Normal';
+            });
           }
         }
+      } else {
+        _alertToleranceFrames = 0;
+        _consecutiveDrowsyFrames++;
+
+        if (mounted) setState(() {
+          _isFaceDrowsy     = true;
+          _drowsinessStatus = 'Drowsy Detected!';
+          _detectionCount++;
+        });
+
+        // Skip first 2 warmup frames, then alert on 1st confirmed drowsy frame
+        if (_consecutiveDrowsyFrames >= 1 && _warmupFrames > 2) {
+          _triggerAlerts();
+        }
+
+        _startDrowsyWallClock();
       }
 
     } catch (e) {
       print('Inference error: $e');
     } finally {
-      _isInferenceRunning = false; // always release guard
+      _isInferenceRunning = false;
     }
   }
 
   // ══════════════════════════════════════════════════════════
-  // WALL CLOCK DROWSY TIMER (replaces frame-count approach)
-  // Counts real seconds regardless of frame speed
+  // WALL CLOCK DROWSY TIMER
   // ══════════════════════════════════════════════════════════
 
   void _startDrowsyWallClock() {
-    if (_drowsyWallClockTimer != null) return; // already running
+    if (_drowsyWallClockTimer != null) return; // already running — don't restart
     print('⏱ Drowsy wall clock started');
     _drowsyWallClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!_isMonitoring) { _stopDrowsyWallClock(); return; }
       _continuousDrowsySeconds++;
-      if (mounted) setState(() {}); // refresh UI counter
+      if (mounted) setState(() {});
 
       print('⏱ Drowsy for $_continuousDrowsySeconds seconds');
 
@@ -366,7 +404,6 @@ class _HomePageState extends State<HomePage> {
     _isDeepSleepMode = true;
     print('🚨 DEEP SLEEP MODE ACTIVATED');
 
-    // Repeated watch notifications every 5 seconds
     _deepSleepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (_isDeepSleepMode) {
         _sendWatchNotification(isDeepSleep: true);
@@ -375,7 +412,6 @@ class _HomePageState extends State<HomePage> {
       }
     });
 
-    // Auto SMS after 60 seconds of no response
     _deepSleepSmsTimer = Timer(const Duration(seconds: 60), () async {
       if (!_isDeepSleepMode) return;
       print('🚨 No response 60s — sending emergency SMS');
@@ -399,6 +435,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _startDeepSleepSound() async {
+    if (_isDisposed) return;
+    try { _audioPlayer.dispose(); } catch (_) {}
+    _audioPlayer = AudioPlayer();
+
     await _audioPlayer.setReleaseMode(ReleaseMode.loop);
     try {
       final prefs      = await SharedPreferences.getInstance();
@@ -420,6 +460,7 @@ class _HomePageState extends State<HomePage> {
 
   void _showDeepSleepDialog() {
     if (!mounted) return;
+    _isAlertShowing = true;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -487,6 +528,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _cancelDeepSleepAlarm() {
+    _isAlertShowing = false;
     _isDeepSleepMode = false;
     _deepSleepTimer?.cancel();
     _deepSleepSmsTimer?.cancel();
@@ -507,21 +549,20 @@ class _HomePageState extends State<HomePage> {
   // ══════════════════════════════════════════════════════════
 
   void _stopAllAlerts() {
-    _audioPlayer.stop();
+    try { _audioPlayer.stop(); } catch (_) {}
     _stopContinuousVibration();
     _alertDelayTimer?.cancel();
-    _isAlertPending = false;
-    if (_isAlertDialogOpen && mounted) {
-      Navigator.of(context, rootNavigator: true).pop();
-      _isAlertDialogOpen = false;
-    }
+    _isAlertPending          = false;
+    _alertToleranceFrames    = 0;
+    _consecutiveDrowsyFrames = 0;
+    // ← REMOVED the Navigator.pop() block entirely
+    // The button's onPressed handles dismissal directly
   }
 
   Future<void> _triggerAlerts() async {
     if (_isAlertPending || _isDeepSleepMode) return;
     _isAlertPending = true;
 
-    // Vibration must be scheduled via Timer to guarantee main thread
     if (_vibrationAlert) {
       Timer(Duration.zero, () {
         Vibration.vibrate(duration: 1000, amplitude: 255);
@@ -547,6 +588,7 @@ class _HomePageState extends State<HomePage> {
   void _showAlertDialog() {
     if (_isAlertDialogOpen) return;
     _isAlertDialogOpen = true;
+    _isAlertShowing    = true;
     _startContinuousVibration();
 
     showDialog(
@@ -570,7 +612,20 @@ class _HomePageState extends State<HomePage> {
         ]),
         actions: [
           ElevatedButton(
-            onPressed: () { _stopAllAlerts(); Navigator.pop(context); },
+            onPressed: () {
+              // Stop everything
+              try { _audioPlayer.stop(); } catch (_) {}
+              _stopContinuousVibration();
+              _alertDelayTimer?.cancel();
+              _isAlertPending          = false;
+              _alertToleranceFrames    = 0;
+              _consecutiveDrowsyFrames = 0;
+              _isFaceDrowsy            = false;
+              _drowsinessStatus        = 'Normal';
+              _stopDrowsyWallClock();
+              // Then dismiss — this triggers .then() below
+              Navigator.of(context).pop();
+            },
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.red.shade400,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -580,16 +635,45 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-    ).then((_) { _isAlertDialogOpen = false; _stopContinuousVibration(); });
+    ).then((_) {
+      _isAlertDialogOpen = false;
+      _isAlertShowing    = false;
+      _stopContinuousVibration();
+      if (!mounted) return;
+      if (mounted) setState(() {
+        _isFaceDrowsy     = false;
+        _drowsinessStatus = 'Normal';
+      });
+      if (!_isCameraInitialized && _isMonitoring) {
+        _initializeCamera().then((_) {
+          if (!mounted) return;
+          if (_isMonitoring && _isCameraInitialized) {
+            _captureTimer?.cancel();
+            _captureTimer = Timer.periodic(
+              const Duration(milliseconds: 1500),
+                  (_) => _captureAndRunInference(),
+            );
+            if (mounted) setState(() => _currentStatus = 'Monitoring active...');
+          }
+        });
+      }
+    });
 
+    // Auto-dismiss after 30s
     Future.delayed(const Duration(seconds: 30), () {
-      if (_isAlertDialogOpen && mounted) { _stopAllAlerts(); Navigator.pop(context); }
+      if (_isAlertDialogOpen && mounted) {
+        _isAlertDialogOpen = false;
+        _isAlertShowing    = false;
+        _stopContinuousVibration();
+        try { Navigator.of(context, rootNavigator: true).pop(); } catch (_) {}
+      }
     });
   }
 
+
   void _startContinuousVibration() {
     _vibrationTimer?.cancel();
-    Vibration.vibrate(duration: 300, amplitude: 255); // immediate
+    Vibration.vibrate(duration: 300, amplitude: 255);
     _vibrationTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       Vibration.vibrate(duration: 300, amplitude: 255);
     });
@@ -602,11 +686,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _playAlertSound() async {
+    if (_isDisposed || !mounted) return;
     try {
       final prefs      = await SharedPreferences.getInstance();
       final selected   = prefs.getString('selectedSound') ?? 'alert_sound.mp3';
       final customPath = prefs.getString('customSoundPath');
-
       if (selected == 'custom' && customPath != null) {
         await _audioPlayer.play(DeviceFileSource(customPath));
       } else {
@@ -631,21 +715,36 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     setState(() {
-      _isMonitoring     = true;
-      _currentStatus    = 'Monitoring active...';
-      _detectionCount   = 0;
-      _drowsinessStatus = 'Normal';
+      _isMonitoring            = true;
+      _currentStatus           = 'Monitoring active...';
+      _detectionCount          = 0;
+      _drowsinessStatus        = 'Normal';
       _consecutiveDrowsyFrames = 0;
       _continuousDrowsySeconds = 0;
-      _warmupFrames             = 0;
+      _warmupFrames            = 0;
+      _alertToleranceFrames    = 0;
     });
-    // Capture every 3 seconds — gives model enough time to finish
+    _fusionService.reset(); // ← reset rolling windows on new session
     _captureTimer = Timer.periodic(
         const Duration(milliseconds: 1500), (_) => _captureAndRunInference());
     _watchService.sendMonitoringStatus(isActive: true);
   }
 
   void _stopMonitoring() {
+    _captureTimer?.cancel();
+    _alertDelayTimer?.cancel();
+    _deepSleepTimer?.cancel();
+    _deepSleepSmsTimer?.cancel();
+    _drowsyWallClockTimer?.cancel();
+    _drowsyWallClockTimer    = null;
+    _isAlertPending          = false;
+    _isDeepSleepMode         = false;
+    _isInferenceRunning      = false;
+    _consecutiveDrowsyFrames = 0;
+    _continuousDrowsySeconds = 0;
+    _alertToleranceFrames    = 0;
+    _fusionService.reset();
+    _stopAllAlerts();
     setState(() {
       _isMonitoring     = false;
       _currentStatus    = 'Monitoring stopped';
@@ -653,17 +752,6 @@ class _HomePageState extends State<HomePage> {
       _faceBox          = null;
       _isFaceDrowsy     = false;
     });
-    _captureTimer?.cancel();
-    _alertDelayTimer?.cancel();
-    _deepSleepTimer?.cancel();
-    _deepSleepSmsTimer?.cancel();
-    _drowsyWallClockTimer?.cancel();
-    _drowsyWallClockTimer = null;
-    _isAlertPending      = false;
-    _isDeepSleepMode     = false;
-    _isInferenceRunning  = false;
-    _consecutiveDrowsyFrames = 0;
-    _continuousDrowsySeconds = 0;
     _watchService.sendMonitoringStatus(isActive: false);
   }
 
@@ -695,28 +783,24 @@ class _HomePageState extends State<HomePage> {
     final message = '🚨 ALERT: ${userData['fullName']} '
         'is drowsy while driving! Detected $_detectionCount times. '
         'Please call immediately!';
-
     final Uri smsUri = Uri(scheme: 'sms', path: phone,
         queryParameters: {'body': message});
     await launchUrl(smsUri, mode: LaunchMode.externalApplication);
-    print('✅ Deep sleep SMS sent to $phone');
   }
+
   Future<void> _sendDeepSleepEmergencySMS(Map<String, dynamic>? userData) async {
     if (userData?['emergencyContact'] == null) return;
-
     final phone = userData!['emergencyContact']['phone']
-        .toString()
-        .replaceAll(RegExp(r'[^\d+]'), '');
-
+        .toString().replaceAll(RegExp(r'[^\d+]'), '');
     final message = '🚨 URGENT: ${userData['fullName']} '
         'has been ASLEEP while driving for over 60 seconds! '
         'No response to alarm. Please call immediately!';
-
     final Uri smsUri = Uri(scheme: 'sms', path: phone,
         queryParameters: {'body': message});
     await launchUrl(smsUri, mode: LaunchMode.externalApplication);
     print('✅ Deep sleep SMS sent to $phone');
   }
+
   // ══════════════════════════════════════════════════════════
   // BLUETOOTH
   // ══════════════════════════════════════════════════════════
@@ -816,7 +900,7 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 12),
             _buildBluetoothCard(),
             const SizedBox(height: 8),
-            if (_isCameraInitialized && _isMonitoring) _buildCameraWithFaceBox(),
+            if (_isMonitoring) _buildCameraWithFaceBox(),
             _buildStatusCard(),
             const SizedBox(height: 24),
             Padding(
@@ -857,16 +941,27 @@ class _HomePageState extends State<HomePage> {
       child: ClipRRect(
         borderRadius: BorderRadius.circular(17),
         child: LayoutBuilder(builder: (context, constraints) {
+          // ← Guard: never render CameraPreview with uninitialized controller
+          if (_cameraController == null ||
+              !_cameraController!.value.isInitialized) {
+            return Container(
+              color: Colors.black,
+              child: const Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            );
+          }
           return Stack(fit: StackFit.expand, children: [
             CameraPreview(_cameraController!),
             if (_faceBox != null)
               CustomPaint(
                 painter: _FaceBoxPainter(
-                  faceBox: _faceBox!, isDrowsy: _isFaceDrowsy,
+                  faceBox: _faceBox!,
+                  isDrowsy: _isFaceDrowsy,
                   previewSize: Size(constraints.maxWidth, constraints.maxHeight),
                   imageSize: Size(
                     _cameraController!.value.previewSize?.height ?? 640,
-                    _cameraController!.value.previewSize?.width ?? 480,
+                    _cameraController!.value.previewSize?.width  ?? 480,
                   ),
                 ),
               ),
@@ -1058,6 +1153,8 @@ class _HomePageState extends State<HomePage> {
 
 // ══════════════════════════════════════════════════════════
 // FACE BOX PAINTER
+// Expects normalized 0–1 coordinates from MediaPipe.
+// Scales them to the preview widget size at paint time.
 // ══════════════════════════════════════════════════════════
 
 class _FaceBoxPainter extends CustomPainter {
@@ -1071,52 +1168,68 @@ class _FaceBoxPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    final Color boxColor =
+    isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841);
+
     final paint = Paint()
-      ..color = isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841)
+      ..color = boxColor
       ..strokeWidth = 3.0
       ..style = PaintingStyle.stroke;
 
     final cornerPaint = Paint()
-      ..color = isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841)
+      ..color = boxColor
       ..strokeWidth = 5.0
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    final double scaleX = previewSize.width  / imageSize.width;
-    final double scaleY = previewSize.height / imageSize.height;
+    // Scale normalized 0–1 coords to preview widget pixels
+    final double rawLeft   = faceBox['left']!   * previewSize.width;
+    final double rawTop    = faceBox['top']!    * previewSize.height;
+    final double rawRight  = faceBox['right']!  * previewSize.width;
+    final double rawBottom = faceBox['bottom']! * previewSize.height;
 
-    const double padX = 30.0;
-    const double padY = 50.0;
+    // Add proportional padding around the face
+    final double padX = (rawRight  - rawLeft)   * 0.08;
+    final double padY = (rawBottom - rawTop)     * 0.08;
 
-    final double left   = (faceBox['left']!   * scaleX - padX).clamp(0, previewSize.width);
-    final double top    = (faceBox['top']!    * scaleY - padY).clamp(0, previewSize.height);
-    final double right  = (faceBox['right']!  * scaleX + padX).clamp(0, previewSize.width);
-    final double bottom = (faceBox['bottom']! * scaleY + 10.0).clamp(0, previewSize.height);
+    final double left   = (rawLeft   - padX).clamp(0.0, previewSize.width);
+    final double top    = (rawTop    - padY).clamp(0.0, previewSize.height);
+    final double right  = (rawRight  + padX).clamp(0.0, previewSize.width);
+    final double bottom = (rawBottom + padY).clamp(0.0, previewSize.height);
 
-    final rect = Rect.fromLTRB(left, top, right, bottom);
-    canvas.drawRect(rect, paint);
+    // Draw bounding rect
+    canvas.drawRect(Rect.fromLTRB(left, top, right, bottom), paint);
 
-    final double cornerLen = (right - left) * 0.2;
-    canvas.drawLine(Offset(left, top), Offset(left + cornerLen, top), cornerPaint);
-    canvas.drawLine(Offset(left, top), Offset(left, top + cornerLen), cornerPaint);
-    canvas.drawLine(Offset(right, top), Offset(right - cornerLen, top), cornerPaint);
-    canvas.drawLine(Offset(right, top), Offset(right, top + cornerLen), cornerPaint);
-    canvas.drawLine(Offset(left, bottom), Offset(left + cornerLen, bottom), cornerPaint);
-    canvas.drawLine(Offset(left, bottom), Offset(left, bottom - cornerLen), cornerPaint);
-    canvas.drawLine(Offset(right, bottom), Offset(right - cornerLen, bottom), cornerPaint);
-    canvas.drawLine(Offset(right, bottom), Offset(right, bottom - cornerLen), cornerPaint);
+    // Draw corner accents
+    final double cLen = (right - left) * 0.2;
+    // Top-left
+    canvas.drawLine(Offset(left, top), Offset(left + cLen, top), cornerPaint);
+    canvas.drawLine(Offset(left, top), Offset(left, top + cLen), cornerPaint);
+    // Top-right
+    canvas.drawLine(Offset(right, top), Offset(right - cLen, top), cornerPaint);
+    canvas.drawLine(Offset(right, top), Offset(right, top + cLen), cornerPaint);
+    // Bottom-left
+    canvas.drawLine(Offset(left, bottom), Offset(left + cLen, bottom), cornerPaint);
+    canvas.drawLine(Offset(left, bottom), Offset(left, bottom - cLen), cornerPaint);
+    // Bottom-right
+    canvas.drawLine(Offset(right, bottom), Offset(right - cLen, bottom), cornerPaint);
+    canvas.drawLine(Offset(right, bottom), Offset(right, bottom - cLen), cornerPaint);
 
+    // Draw label — above box if space, below if near top edge
     final textSpan = TextSpan(
       text: isDrowsy ? ' DROWSY ' : ' ALERT ',
       style: TextStyle(
-        color: isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841),
-        fontSize: 13, fontWeight: FontWeight.bold,
+        color: boxColor,
+        fontSize: 13,
+        fontWeight: FontWeight.bold,
         background: Paint()..color = Colors.black.withOpacity(0.5),
       ),
     );
-    final textPainter = TextPainter(text: textSpan, textDirection: TextDirection.ltr);
+    final textPainter = TextPainter(
+        text: textSpan, textDirection: TextDirection.ltr);
     textPainter.layout();
-    textPainter.paint(canvas, Offset(left, top - 20));
+    final double labelY = top > 24 ? top - 20 : bottom + 4;
+    textPainter.paint(canvas, Offset(left, labelY));
   }
 
   @override

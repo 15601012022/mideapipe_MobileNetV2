@@ -29,6 +29,8 @@ class MainActivity : FlutterActivity(), MessageClient.OnMessageReceivedListener 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
+        flutterEngine.plugins.add(MediaPipePlugin())
+
         methodChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger, CHANNEL
         )
