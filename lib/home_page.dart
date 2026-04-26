@@ -18,14 +18,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'services/mediapipe_channel.dart';
 import 'services/fusion_service.dart';
 
-
 class HomePage extends StatefulWidget {
   const HomePage({Key? key}) : super(key: key);
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
-// ← WidgetsBindingObserver added for lifecycle handling
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ── Alert state ───────────────────────────────────────────
@@ -33,28 +31,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer? _alertDelayTimer;
   Timer? _deepSleepTimer;
   Timer? _deepSleepSmsTimer;
+
   Timer? _drowsyWallClockTimer;
-  bool _isDisposed = false;
-  bool  _isAlertDialogOpen = false;
-  bool  _isAlertPending    = false;
-  bool  _isAlertShowing = false;
-  bool  _isDeepSleepMode   = false;
-  bool  _isInferenceRunning = false;
-  int   _consecutiveDrowsyFrames = 0;
-  int   _continuousDrowsySeconds = 0;
-  int   _alertToleranceFrames    = 0;
-  int   _warmupFrames            = 0;
+  bool  _wallClockRunning      = false;
+
+  bool _isDisposed             = false;
+  bool _isAlertDialogOpen      = false;
+  bool _isAlertPending         = false;
+  bool _isAlertShowing         = false;
+  bool _isDeepSleepMode        = false;
+  bool _isInferenceRunning     = false;
+  int  _consecutiveDrowsyFrames = 0;
+  int  _continuousDrowsySeconds = 0;
+  int  _alertToleranceFrames   = 0;
+  int  _warmupFrames           = 0;
+
+  bool _isAudioPlaying = false;
 
   // ── Services ──────────────────────────────────────────────
-  final MLModelService        _mlModelService       = MLModelService();
-  final MediaPipeChannel      _mediaPipe            = MediaPipeChannel();
-  final FusionService         _fusionService        = FusionService();
-  final WatchService          _watchService         = WatchService();
+  final MLModelService            _mlModelService      = MLModelService();
+  final MediaPipeChannel          _mediaPipe           = MediaPipeChannel();
+  final FusionService             _fusionService       = FusionService();
+  final WatchService              _watchService        = WatchService();
   AudioPlayer _audioPlayer = AudioPlayer();
-  final FirebaseAuth          _auth                 = FirebaseAuth.instance;
-  final FirebaseFirestore     _firestore            = FirebaseFirestore.instance;
+  final FirebaseAuth              _auth                = FirebaseAuth.instance;
+  final FirebaseFirestore         _firestore           = FirebaseFirestore.instance;
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
-  FlutterLocalNotificationsPlugin();
+      FlutterLocalNotificationsPlugin();
 
   // ── Camera ────────────────────────────────────────────────
   CameraController? _cameraController;
@@ -75,10 +78,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _isFaceDrowsy = false;
 
   // ── Settings ──────────────────────────────────────────────
-  bool _soundAlert          = true;
-  bool _vibrationAlert      = true;
-  bool _smsAlert            = false;
-  int  _drowsinessThreshold = 3;
+  bool   _soundEnabled      = true;
+  bool   _vibrationEnabled  = true;
+  bool   _smsAlert          = false;
+  int    _drowsinessThreshold = 3;
+  String _selectedSound     = 'alert_sound.mp3';
+
+  bool get _soundAlert     => _soundEnabled;
+  bool get _vibrationAlert => _vibrationEnabled;
 
   // ── Bluetooth ─────────────────────────────────────────────
   bool _isBluetoothCameraConnected = false;
@@ -99,8 +106,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // ← lifecycle observer
+    WidgetsBinding.instance.addObserver(this);
+    _initAudioPlayer();
     _initializeApp();
+  }
+
+  void _initAudioPlayer() {
+    _audioPlayer.onPlayerStateChanged.listen((state) {
+      _isAudioPlaying = (state == PlayerState.playing);
+    });
   }
 
   Future<void> _initializeApp() async {
@@ -109,13 +123,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await _initWatch();
     await _initNotifications();
     final mpReady = await _mediaPipe.isInitialized();
-    print('MediaPipe ready: $mpReady');
+    debugPrint('MediaPipe ready: $mpReady');
   }
 
   @override
   void dispose() {
     _isDisposed = true;
-    WidgetsBinding.instance.removeObserver(this); // ← remove observer
+    WidgetsBinding.instance.removeObserver(this);
     _watchCommandSub?.cancel();
     _cameraController?.dispose();
     _captureTimer?.cancel();
@@ -125,14 +139,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _drowsyWallClockTimer?.cancel();
     _vibrationTimer?.cancel();
     _fusionService.reset();
+    try { _audioPlayer.stop(); } catch (_) {}
     super.dispose();
   }
 
-  /// Handles app going to background / coming back to foreground.
-  /// Fixes the black screen after pressing "Stop Monitoring" or switching apps.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Only handle true background, never inactive (dialogs trigger inactive)
     if (state != AppLifecycleState.paused &&
         state != AppLifecycleState.resumed) return;
 
@@ -151,7 +163,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _captureTimer?.cancel();
             _captureTimer = Timer.periodic(
               const Duration(milliseconds: 1500),
-                  (_) => _captureAndRunInference(),
+              (_) => _captureAndRunInference(),
             );
           }
         });
@@ -159,14 +171,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-
   // ══════════════════════════════════════════════════════════
   // NOTIFICATIONS + WATCH
   // ══════════════════════════════════════════════════════════
 
   Future<void> _initNotifications() async {
     const AndroidInitializationSettings androidSettings =
-    AndroidInitializationSettings('@mipmap/ic_launcher');
+        AndroidInitializationSettings('@mipmap/ic_launcher');
     await _notificationsPlugin.initialize(
         const InitializationSettings(android: androidSettings));
     await Permission.notification.request();
@@ -243,7 +254,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return;
       }
       final frontCamera = _cameras!.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.front,
+        (c) => c.lensDirection == CameraLensDirection.front,
         orElse: () => _cameras!.first,
       );
       _cameraController = CameraController(
@@ -265,7 +276,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // ══════════════════════════════════════════════════════════
 
   Future<void> _captureAndRunInference() async {
-    // Guard: skip if camera is gone or inference already running
     if (_isInferenceRunning || !_isCameraInitialized) return;
     if (_cameraController == null || !_cameraController!.value.isInitialized) return;
 
@@ -296,7 +306,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       );
       final bool isDrowsy = fusResult.isDrowsy;
 
-      print('DEBUG: face=${mpResult.faceDetected} '
+      debugPrint('DEBUG: face=${mpResult.faceDetected} '
           'EAR=${mpResult.ear.toStringAsFixed(3)} '
           'MAR=${mpResult.mar.toStringAsFixed(3)} '
           'model=${modelScore.toStringAsFixed(3)} '
@@ -326,17 +336,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _warmupFrames++;
 
       // STEP 6: Frame counter + alert logic
-      // Single if/else — no duplicate blocks
       if (!isDrowsy) {
         _consecutiveDrowsyFrames = 0;
         _alertToleranceFrames++;
 
-        // Require 3 consecutive alert frames before declaring truly alert
-        // This prevents one bright frame killing a drowsy streak
-        if (_alertToleranceFrames >= 3) {
+        if (_alertToleranceFrames >= 1) {
           _alertToleranceFrames = 0;
-          _stopDrowsyWallClock();
+          _stopDrowsyWallClock();              // also calls _dismissActiveAlerts()
           if (_isDeepSleepMode) _cancelDeepSleepAlarm();
+          _dismissActiveAlerts();              // ← NEW: auto-dismiss any open alert dialog
           if (!_isAlertPending && mounted) {
             setState(() {
               _isFaceDrowsy     = false;
@@ -354,7 +362,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _detectionCount++;
         });
 
-        // Skip first 2 warmup frames, then alert on 1st confirmed drowsy frame
         if (_consecutiveDrowsyFrames >= 1 && _warmupFrames > 2) {
           _triggerAlerts();
         }
@@ -363,7 +370,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
 
     } catch (e) {
-      print('Inference error: $e');
+      debugPrint('Inference error: $e');
     } finally {
       _isInferenceRunning = false;
     }
@@ -374,25 +381,100 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // ══════════════════════════════════════════════════════════
 
   void _startDrowsyWallClock() {
-    if (_drowsyWallClockTimer != null) return; // already running — don't restart
-    print('⏱ Drowsy wall clock started');
-    _drowsyWallClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!_isMonitoring) { _stopDrowsyWallClock(); return; }
-      _continuousDrowsySeconds++;
-      if (mounted) setState(() {});
+    if (_wallClockRunning) return;
+    _wallClockRunning = true;
+    _continuousDrowsySeconds = 0;
 
-      print('⏱ Drowsy for $_continuousDrowsySeconds seconds');
+    _drowsyWallClockTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) { timer.cancel(); return; }
 
-      if (_continuousDrowsySeconds >= 30 && !_isDeepSleepMode) {
+      setState(() => _continuousDrowsySeconds++);
+      final secs = _continuousDrowsySeconds;
+
+      if (secs >= 30) {
+        _setAlertTier(3);
+      } else if (secs >= 10) {
+        _setAlertTier(2);
+      } else if (secs >= 1) {
+        _setAlertTier(1);
+      }
+
+      if (secs == 40) {
         _triggerDeepSleepAlarm();
       }
     });
   }
 
+  Future<void> _setAlertTier(int tier) async {
+    if (_isDisposed) return;
+    switch (tier) {
+      case 1:
+        if (_vibrationEnabled) {
+          Vibration.vibrate(duration: 200, amplitude: 64);
+        }
+        break;
+      case 2:
+        if (_vibrationEnabled) {
+          Vibration.vibrate(duration: 400, amplitude: 128);
+        }
+        if (_soundEnabled && !_isAudioPlaying) {
+          await _audioPlayer.setVolume(0.5);
+          await _audioPlayer.play(AssetSource(_selectedSound));
+        }
+        break;
+      case 3:
+        if (_vibrationEnabled) {
+          Vibration.vibrate(duration: 600, amplitude: 255);
+        }
+        if (_soundEnabled) {
+          await _audioPlayer.setVolume(1.0);
+          if (!_isAudioPlaying) {
+            await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+            await _audioPlayer.play(AssetSource(_selectedSound));
+          }
+        }
+        break;
+    }
+  }
+
   void _stopDrowsyWallClock() {
     _drowsyWallClockTimer?.cancel();
     _drowsyWallClockTimer = null;
+    _wallClockRunning = false;
     if (mounted) setState(() => _continuousDrowsySeconds = 0);
+    _dismissActiveAlerts();              // ← NEW: dismiss any open alert when clock stops
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // AUTO-DISMISS HELPER  ← NEW METHOD
+  // ══════════════════════════════════════════════════════════
+
+  /// Safely dismisses any open drowsiness alert dialog when the driver
+  /// returns to a normal/alert state. Skips deep sleep — that has its own flow.
+  void _dismissActiveAlerts() {
+    if (!mounted) return;
+    if (_isDeepSleepMode) return;
+    if (_isAlertDialogOpen || _isAlertShowing) {
+      _isAlertDialogOpen = false;
+      _isAlertShowing    = false;
+      // Stop audio and vibration immediately
+      try { _audioPlayer.stop(); } catch (_) {}
+      _stopContinuousVibration();
+      _alertDelayTimer?.cancel();
+      _isAlertPending = false;
+      // Pop the dialog
+      try {
+        Navigator.of(context, rootNavigator: true).pop();
+      } catch (_) {}
+      // Reset UI state
+      if (mounted) {
+        setState(() {
+          _isFaceDrowsy     = false;
+          _drowsinessStatus = 'Normal';
+        });
+      }
+      debugPrint('✅ Alert auto-dismissed — driver is awake');
+    }
   }
 
   // ══════════════════════════════════════════════════════════
@@ -402,7 +484,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _triggerDeepSleepAlarm() {
     if (_isDeepSleepMode) return;
     _isDeepSleepMode = true;
-    print('🚨 DEEP SLEEP MODE ACTIVATED');
+    debugPrint('🚨 DEEP SLEEP MODE ACTIVATED');
 
     _deepSleepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (_isDeepSleepMode) {
@@ -414,7 +496,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     _deepSleepSmsTimer = Timer(const Duration(seconds: 60), () async {
       if (!_isDeepSleepMode) return;
-      print('🚨 No response 60s — sending emergency SMS');
+      debugPrint('🚨 No response 60s — sending emergency SMS');
       final user = _auth.currentUser;
       if (user == null) return;
       final doc = await _firestore.collection('users').doc(user.uid).get();
@@ -436,10 +518,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _startDeepSleepSound() async {
     if (_isDisposed) return;
-    try { _audioPlayer.dispose(); } catch (_) {}
-    _audioPlayer = AudioPlayer();
-
+    await _audioPlayer.stop();
     await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+
     try {
       final prefs      = await SharedPreferences.getInstance();
       final selected   = prefs.getString('selectedSound') ?? 'alert_sound.mp3';
@@ -452,9 +533,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (e) {
       await _audioPlayer.play(AssetSource('alert_sound.mp3'));
     }
+
     _vibrationTimer?.cancel();
     _vibrationTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
-      Vibration.vibrate(duration: 250, amplitude: 255);
+      if (!_isDisposed) Vibration.vibrate(duration: 250, amplitude: 255);
     });
   }
 
@@ -485,10 +567,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text('You have been drowsy for 30+ seconds!\nPull over immediately!',
-                  style: TextStyle(color: Colors.white, fontSize: 16,
-                      fontWeight: FontWeight.w500),
-                  textAlign: TextAlign.center),
+              const Text(
+                'You have been drowsy for 30+ seconds!\nPull over immediately!',
+                style: TextStyle(color: Colors.white, fontSize: 16,
+                    fontWeight: FontWeight.w500),
+                textAlign: TextAlign.center,
+              ),
               const SizedBox(height: 16),
               Container(
                 padding: const EdgeInsets.all(12),
@@ -509,7 +593,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: () { _cancelDeepSleepAlarm(); Navigator.pop(context); },
+                onPressed: () {
+                  _cancelDeepSleepAlarm();
+                  Navigator.of(context).pop();
+                },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.white,
                   foregroundColor: Colors.red.shade900,
@@ -528,20 +615,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void _cancelDeepSleepAlarm() {
-    _isAlertShowing = false;
+    _isAlertShowing  = false;
     _isDeepSleepMode = false;
     _deepSleepTimer?.cancel();
     _deepSleepSmsTimer?.cancel();
     _drowsyWallClockTimer?.cancel();
     _drowsyWallClockTimer = null;
+    _wallClockRunning = false;
     _audioPlayer.stop();
     _audioPlayer.setReleaseMode(ReleaseMode.release);
     _stopContinuousVibration();
-    _isAlertPending    = false;
-    _isAlertDialogOpen = false;
+    _isAlertPending          = false;
+    _isAlertDialogOpen       = false;
     _continuousDrowsySeconds = 0;
     if (mounted) setState(() {});
-    print('✅ Deep sleep alarm cancelled');
+    debugPrint('✅ Deep sleep alarm cancelled');
   }
 
   // ══════════════════════════════════════════════════════════
@@ -555,12 +643,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _isAlertPending          = false;
     _alertToleranceFrames    = 0;
     _consecutiveDrowsyFrames = 0;
-    // ← REMOVED the Navigator.pop() block entirely
-    // The button's onPressed handles dismissal directly
+    _wallClockRunning        = false;
+    // No Navigator.pop() here — callers handle dismissal
   }
 
   Future<void> _triggerAlerts() async {
     if (_isAlertPending || _isDeepSleepMode) return;
+
+    // If wall clock was already stopped and user is awake, skip re-alert
+    if (_continuousDrowsySeconds == 0 && !_wallClockRunning) return;
+
     _isAlertPending = true;
 
     if (_vibrationAlert) {
@@ -613,7 +705,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         actions: [
           ElevatedButton(
             onPressed: () {
-              // Stop everything
               try { _audioPlayer.stop(); } catch (_) {}
               _stopContinuousVibration();
               _alertDelayTimer?.cancel();
@@ -623,7 +714,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               _isFaceDrowsy            = false;
               _drowsinessStatus        = 'Normal';
               _stopDrowsyWallClock();
-              // Then dismiss — this triggers .then() below
+              _isAlertShowing          = false;
               Navigator.of(context).pop();
             },
             style: ElevatedButton.styleFrom(
@@ -640,7 +731,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _isAlertShowing    = false;
       _stopContinuousVibration();
       if (!mounted) return;
-      if (mounted) setState(() {
+      setState(() {
         _isFaceDrowsy     = false;
         _drowsinessStatus = 'Normal';
       });
@@ -651,7 +742,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _captureTimer?.cancel();
             _captureTimer = Timer.periodic(
               const Duration(milliseconds: 1500),
-                  (_) => _captureAndRunInference(),
+              (_) => _captureAndRunInference(),
             );
             if (mounted) setState(() => _currentStatus = 'Monitoring active...');
           }
@@ -670,12 +761,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
-
   void _startContinuousVibration() {
     _vibrationTimer?.cancel();
     Vibration.vibrate(duration: 300, amplitude: 255);
     _vibrationTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      Vibration.vibrate(duration: 300, amplitude: 255);
+      if (!_isDisposed) Vibration.vibrate(duration: 300, amplitude: 255);
     });
   }
 
@@ -705,7 +795,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // MONITORING
   // ══════════════════════════════════════════════════════════
 
-  void _toggleMonitoring() => _isMonitoring ? _stopMonitoring() : _startMonitoring();
+  void _toggleMonitoring() =>
+      _isMonitoring ? _stopMonitoring() : _startMonitoring();
 
   void _startMonitoring() {
     if (!_isCameraInitialized) {
@@ -723,8 +814,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _continuousDrowsySeconds = 0;
       _warmupFrames            = 0;
       _alertToleranceFrames    = 0;
+      _wallClockRunning        = false;
     });
-    _fusionService.reset(); // ← reset rolling windows on new session
+    _fusionService.reset();
     _captureTimer = Timer.periodic(
         const Duration(milliseconds: 1500), (_) => _captureAndRunInference());
     _watchService.sendMonitoringStatus(isActive: true);
@@ -737,6 +829,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _deepSleepSmsTimer?.cancel();
     _drowsyWallClockTimer?.cancel();
     _drowsyWallClockTimer    = null;
+    _wallClockRunning        = false;
     _isAlertPending          = false;
     _isDeepSleepMode         = false;
     _isInferenceRunning      = false;
@@ -766,14 +859,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final doc = await _firestore.collection('users').doc(user.uid).get();
       if (doc.exists && mounted) {
         final data = doc.data();
+        final prefs = await SharedPreferences.getInstance();
         setState(() {
-          _soundAlert          = data?['soundAlert']          ?? true;
-          _vibrationAlert      = data?['vibrationAlert']      ?? true;
+          _soundEnabled        = data?['soundAlert']          ?? true;
+          _vibrationEnabled    = data?['vibrationAlert']      ?? true;
           _smsAlert            = data?['smsAlert']            ?? false;
           _drowsinessThreshold = data?['drowsinessThreshold'] ?? 3;
+          _selectedSound       = prefs.getString('selectedSound') ?? 'alert_sound.mp3';
         });
       }
-    } catch (e) { print('Settings error: $e'); }
+    } catch (e) { debugPrint('Settings error: $e'); }
   }
 
   Future<void> _sendEmergencySMS(Map<String, dynamic>? userData) async {
@@ -798,7 +893,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final Uri smsUri = Uri(scheme: 'sms', path: phone,
         queryParameters: {'body': message});
     await launchUrl(smsUri, mode: LaunchMode.externalApplication);
-    print('✅ Deep sleep SMS sent to $phone');
+    debugPrint('✅ Deep sleep SMS sent to $phone');
   }
 
   // ══════════════════════════════════════════════════════════
@@ -824,7 +919,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     devicesList.clear();
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
     final sub = FlutterBluePlus.scanResults.listen(
-            (results) => setState(() => devicesList = results.map((r) => r.device).toList()));
+        (results) => setState(() =>
+            devicesList = results.map((r) => r.device).toList()));
     await Future.delayed(const Duration(seconds: 5));
     FlutterBluePlus.stopScan();
     sub.cancel();
@@ -841,15 +937,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             itemBuilder: (context, index) {
               final device = devicesList[index];
               return ListTile(
-                title: Text(device.platformName.isEmpty ? 'Unknown' : device.platformName),
+                title: Text(device.platformName.isEmpty
+                    ? 'Unknown' : device.platformName),
                 subtitle: Text(device.remoteId.toString()),
-                onTap: () { _connectToDevice(device); Navigator.pop(context); },
+                onTap: () {
+                  _connectToDevice(device);
+                  Navigator.pop(context);
+                },
               );
             },
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel'))
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'))
         ],
       ),
     );
@@ -859,7 +961,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try {
       await device.connect();
       setState(() {
-        connectedDevice = device;
+        connectedDevice             = device;
         _isBluetoothCameraConnected = true;
         _bluetoothStatus = 'Connected: ${device.platformName}';
       });
@@ -886,11 +988,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         actions: [
           IconButton(
             icon: const Icon(Icons.watch, color: Colors.white),
-            onPressed: () => Navigator.push(context, MaterialPageRoute(
-              builder: (_) => WatchScreen(
-                  isMonitoring: _isMonitoring, isDrowsy: _isFaceDrowsy,
-                  detectionCount: _detectionCount, earScore: 0.0),
-            )),
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => WatchScreen(
+                  isMonitoring:   _isMonitoring,
+                  isDrowsy:       _isFaceDrowsy,
+                  detectionCount: _detectionCount,
+                  earScore:       0.0,
+                ))),
           ),
         ],
       ),
@@ -907,11 +1011,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Row(children: [
                 Expanded(child: _buildStatCard(
-                    title: 'Detections', value: '$_detectionCount',
-                    icon: Icons.warning_amber_rounded, color: kOrange)),
+                    title: 'Detections',
+                    value: '$_detectionCount',
+                    icon: Icons.warning_amber_rounded,
+                    color: kOrange)),
                 const SizedBox(width: 16),
                 Expanded(child: _buildStatCard(
-                    title: 'Status', value: _isMonitoring ? 'Active' : 'Inactive',
+                    title: 'Status',
+                    value: _isMonitoring ? 'Active' : 'Inactive',
                     icon: Icons.info_outline,
                     color: _isMonitoring ? Colors.green : Colors.grey)),
               ]),
@@ -941,14 +1048,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       child: ClipRRect(
         borderRadius: BorderRadius.circular(17),
         child: LayoutBuilder(builder: (context, constraints) {
-          // ← Guard: never render CameraPreview with uninitialized controller
           if (_cameraController == null ||
               !_cameraController!.value.isInitialized) {
             return Container(
               color: Colors.black,
               child: const Center(
-                child: CircularProgressIndicator(color: Colors.white),
-              ),
+                  child: CircularProgressIndicator(color: Colors.white)),
             );
           }
           return Stack(fit: StackFit.expand, children: [
@@ -956,8 +1061,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             if (_faceBox != null)
               CustomPaint(
                 painter: _FaceBoxPainter(
-                  faceBox: _faceBox!,
-                  isDrowsy: _isFaceDrowsy,
+                  faceBox:     _faceBox!,
+                  isDrowsy:    _isFaceDrowsy,
                   previewSize: Size(constraints.maxWidth, constraints.maxHeight),
                   imageSize: Size(
                     _cameraController!.value.previewSize?.height ?? 640,
@@ -970,7 +1075,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 top: 10, left: 0, right: 0,
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 6),
                     decoration: BoxDecoration(
                         color: kRed.withOpacity(0.85),
                         borderRadius: BorderRadius.circular(20)),
@@ -985,7 +1091,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 bottom: 10, left: 0, right: 0,
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 6),
                     decoration: BoxDecoration(
                         color: Colors.red.shade900.withOpacity(0.9),
                         borderRadius: BorderRadius.circular(20)),
@@ -1010,10 +1117,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
       child: Container(
         padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: Colors.white,
+        decoration: BoxDecoration(
+            color: Colors.white,
             borderRadius: BorderRadius.circular(18),
-            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05),
-                blurRadius: 10, offset: const Offset(0, 5))]),
+            boxShadow: [BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 10,
+                offset: const Offset(0, 5))]),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             const Icon(Icons.bluetooth, color: Colors.blue, size: 24),
@@ -1022,23 +1132,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600))),
             ElevatedButton.icon(
               onPressed: _connectBluetoothCamera,
-              icon: Icon(_isBluetoothCameraConnected ? Icons.link_off : Icons.link,
+              icon: Icon(
+                  _isBluetoothCameraConnected ? Icons.link_off : Icons.link,
                   size: 18, color: Colors.white),
               label: Text(_isBluetoothCameraConnected ? 'Disconnect' : 'Connect'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: _isBluetoothCameraConnected
                     ? Colors.red.shade400 : Colors.blue,
                 foregroundColor: Colors.white,
-                minimumSize: const Size(70, 32), elevation: 0,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                minimumSize: const Size(70, 32),
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 6),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
               ),
             ),
           ]),
           const SizedBox(height: 6),
           Text('Status: $_bluetoothStatus',
-              style: TextStyle(fontSize: 13,
-                  color: _isBluetoothCameraConnected ? Colors.green : Colors.grey)),
+              style: TextStyle(
+                  fontSize: 13,
+                  color: _isBluetoothCameraConnected
+                      ? Colors.green : Colors.grey)),
         ]),
       ),
     );
@@ -1049,10 +1165,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       padding: const EdgeInsets.symmetric(horizontal: 20),
       child: Container(
         padding: const EdgeInsets.all(24),
-        decoration: BoxDecoration(color: Colors.white,
+        decoration: BoxDecoration(
+            color: Colors.white,
             borderRadius: BorderRadius.circular(20),
-            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05),
-                blurRadius: 10, offset: const Offset(0, 5))]),
+            boxShadow: [BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 10,
+                offset: const Offset(0, 5))]),
         child: Column(children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
@@ -1060,23 +1179,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             decoration: BoxDecoration(
               color: _isDeepSleepMode
                   ? Colors.red.shade900.withOpacity(0.15)
-                  : _isFaceDrowsy ? kRed.withOpacity(0.1) : kGreen.withOpacity(0.1),
+                  : _isFaceDrowsy
+                      ? kRed.withOpacity(0.1)
+                      : kGreen.withOpacity(0.1),
               shape: BoxShape.circle,
             ),
             child: Icon(
-              _isDeepSleepMode ? Icons.emergency
-                  : _isFaceDrowsy ? Icons.warning_amber_rounded
-                  : _isMonitoring ? Icons.visibility : Icons.visibility_off,
+              _isDeepSleepMode
+                  ? Icons.emergency
+                  : _isFaceDrowsy
+                      ? Icons.warning_amber_rounded
+                      : _isMonitoring
+                          ? Icons.visibility
+                          : Icons.visibility_off,
               size: 40,
-              color: _isDeepSleepMode ? Colors.red.shade900
+              color: _isDeepSleepMode
+                  ? Colors.red.shade900
                   : _isFaceDrowsy ? kRed : kGreen,
             ),
           ),
           const SizedBox(height: 16),
           Text(
             _isDeepSleepMode ? '🚨 DEEP SLEEP!' : _drowsinessStatus,
-            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold,
-                color: _isDeepSleepMode ? Colors.red.shade900
+            style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: _isDeepSleepMode
+                    ? Colors.red.shade900
                     : _isFaceDrowsy ? kRed : Colors.black87),
           ),
           const SizedBox(height: 8),
@@ -1084,7 +1213,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             Text(
               'Drowsy for ${_continuousDrowsySeconds}s'
                   '${_continuousDrowsySeconds >= 20 ? ' — WARNING!' : ''}',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500,
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
                   color: _continuousDrowsySeconds >= 20 ? kRed : kOrange),
             ),
           Text(_currentStatus,
@@ -1096,33 +1227,47 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             child: ElevatedButton(
               onPressed: _isCameraInitialized ? _toggleMonitoring : null,
               style: ElevatedButton.styleFrom(
-                backgroundColor: _isMonitoring ? Colors.red.shade400 : kGreen,
+                backgroundColor:
+                    _isMonitoring ? Colors.red.shade400 : kGreen,
                 foregroundColor: Colors.white,
                 disabledBackgroundColor: Colors.grey.shade300,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
                 elevation: 0,
               ),
-              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Icon(_isMonitoring ? Icons.stop_circle : Icons.play_circle_filled,
-                    size: 28),
-                const SizedBox(width: 12),
-                Text(_isMonitoring ? 'Stop Monitoring' : 'Start Monitoring',
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              ]),
+              child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(_isMonitoring
+                        ? Icons.stop_circle
+                        : Icons.play_circle_filled, size: 28),
+                    const SizedBox(width: 12),
+                    Text(
+                        _isMonitoring
+                            ? 'Stop Monitoring'
+                            : 'Start Monitoring',
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold)),
+                  ]),
             ),
           ),
           if (!_isCameraInitialized) ...[
             const SizedBox(height: 12),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(color: Colors.orange.shade50,
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                  color: Colors.orange.shade50,
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(color: Colors.orange.shade200)),
               child: Row(children: [
-                Icon(Icons.info_outline, color: Colors.orange.shade700, size: 20),
+                Icon(Icons.info_outline,
+                    color: Colors.orange.shade700, size: 20),
                 const SizedBox(width: 8),
-                Expanded(child: Text('Waiting for camera initialization...',
-                    style: TextStyle(fontSize: 12, color: Colors.orange.shade900))),
+                Expanded(child: Text(
+                    'Waiting for camera initialization...',
+                    style: TextStyle(
+                        fontSize: 12, color: Colors.orange.shade900))),
               ]),
             ),
           ],
@@ -1131,21 +1276,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildStatCard({required String title, required String value,
-    required IconData icon, required Color color}) {
+  Widget _buildStatCard({
+    required String title,
+    required String value,
+    required IconData icon,
+    required Color color,
+  }) {
     return Container(
       padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(color: Colors.white,
+      decoration: BoxDecoration(
+          color: Colors.white,
           borderRadius: BorderRadius.circular(16),
-          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05),
-              blurRadius: 10, offset: const Offset(0, 5))]),
+          boxShadow: [BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: 10,
+              offset: const Offset(0, 5))]),
       child: Column(children: [
         Icon(icon, size: 32, color: color),
         const SizedBox(height: 12),
-        Text(value, style: TextStyle(fontSize: 24,
-            fontWeight: FontWeight.bold, color: color)),
+        Text(value,
+            style: TextStyle(
+                fontSize: 24, fontWeight: FontWeight.bold, color: color)),
         const SizedBox(height: 4),
-        Text(title, style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
+        Text(title,
+            style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
       ]),
     );
   }
@@ -1153,8 +1307,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
 // ══════════════════════════════════════════════════════════
 // FACE BOX PAINTER
-// Expects normalized 0–1 coordinates from MediaPipe.
-// Scales them to the preview widget size at paint time.
 // ══════════════════════════════════════════════════════════
 
 class _FaceBoxPainter extends CustomPainter {
@@ -1163,13 +1315,17 @@ class _FaceBoxPainter extends CustomPainter {
   final Size previewSize;
   final Size imageSize;
 
-  _FaceBoxPainter({required this.faceBox, required this.isDrowsy,
-    required this.previewSize, required this.imageSize});
+  _FaceBoxPainter({
+    required this.faceBox,
+    required this.isDrowsy,
+    required this.previewSize,
+    required this.imageSize,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
     final Color boxColor =
-    isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841);
+        isDrowsy ? const Color(0xFFE53935) : const Color(0xFF78C841);
 
     final paint = Paint()
       ..color = boxColor
@@ -1182,40 +1338,31 @@ class _FaceBoxPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    // Scale normalized 0–1 coords to preview widget pixels
     final double rawLeft   = faceBox['left']!   * previewSize.width;
     final double rawTop    = faceBox['top']!    * previewSize.height;
     final double rawRight  = faceBox['right']!  * previewSize.width;
     final double rawBottom = faceBox['bottom']! * previewSize.height;
 
-    // Add proportional padding around the face
-    final double padX = (rawRight  - rawLeft)   * 0.08;
-    final double padY = (rawBottom - rawTop)     * 0.08;
+    final double padX = (rawRight  - rawLeft)  * 0.08;
+    final double padY = (rawBottom - rawTop)   * 0.08;
 
     final double left   = (rawLeft   - padX).clamp(0.0, previewSize.width);
     final double top    = (rawTop    - padY).clamp(0.0, previewSize.height);
     final double right  = (rawRight  + padX).clamp(0.0, previewSize.width);
     final double bottom = (rawBottom + padY).clamp(0.0, previewSize.height);
 
-    // Draw bounding rect
     canvas.drawRect(Rect.fromLTRB(left, top, right, bottom), paint);
 
-    // Draw corner accents
     final double cLen = (right - left) * 0.2;
-    // Top-left
-    canvas.drawLine(Offset(left, top), Offset(left + cLen, top), cornerPaint);
-    canvas.drawLine(Offset(left, top), Offset(left, top + cLen), cornerPaint);
-    // Top-right
-    canvas.drawLine(Offset(right, top), Offset(right - cLen, top), cornerPaint);
-    canvas.drawLine(Offset(right, top), Offset(right, top + cLen), cornerPaint);
-    // Bottom-left
+    canvas.drawLine(Offset(left, top),    Offset(left + cLen, top),    cornerPaint);
+    canvas.drawLine(Offset(left, top),    Offset(left, top + cLen),    cornerPaint);
+    canvas.drawLine(Offset(right, top),   Offset(right - cLen, top),   cornerPaint);
+    canvas.drawLine(Offset(right, top),   Offset(right, top + cLen),   cornerPaint);
     canvas.drawLine(Offset(left, bottom), Offset(left + cLen, bottom), cornerPaint);
     canvas.drawLine(Offset(left, bottom), Offset(left, bottom - cLen), cornerPaint);
-    // Bottom-right
-    canvas.drawLine(Offset(right, bottom), Offset(right - cLen, bottom), cornerPaint);
-    canvas.drawLine(Offset(right, bottom), Offset(right, bottom - cLen), cornerPaint);
+    canvas.drawLine(Offset(right, bottom),Offset(right - cLen, bottom),cornerPaint);
+    canvas.drawLine(Offset(right, bottom),Offset(right, bottom - cLen),cornerPaint);
 
-    // Draw label — above box if space, below if near top edge
     final textSpan = TextSpan(
       text: isDrowsy ? ' DROWSY ' : ' ALERT ',
       style: TextStyle(

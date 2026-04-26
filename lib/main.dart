@@ -28,9 +28,9 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.green,
         fontFamily: 'Roboto',
       ),
-      initialRoute: '/',
+      home: const AuthGate(),
+
       routes: {
-        '/': (context) => const WelcomeScreen(),
         '/signin': (context) => const SignInScreen(),
         '/signup': (context) => const SignUpScreen(),
         '/account': (context) => const MainNavigation(),
@@ -40,20 +40,17 @@ class MyApp extends StatelessWidget {
 }
 
 class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (snapshot.hasData && snapshot.data != null) {
-          return const MainNavigation();
-        }
-        return const WelcomeScreen();
-      },
-    );
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user != null) {
+      return const MainNavigation(); // ✅ already logged in
+    } else {
+      return const WelcomeScreen(); // ❌ not logged in
+    }
   }
 }
 

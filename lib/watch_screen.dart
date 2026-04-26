@@ -25,16 +25,19 @@ class _WatchScreenState extends State<WatchScreen>
     with SingleTickerProviderStateMixin {
   final WatchService _watchService = WatchService();
 
-  // FIX: Titan watch is always "connected" if Bluetooth is paired
   bool _isConnected = true;
   bool _isSending = false;
+  bool _isLoadingName = true; // shows shimmer/placeholder while fetching
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
   int _heartRate = 72;
   StreamSubscription<String>? _commandSub;
 
-  static const Color kGreen = Color(0xFF78C841);
-  static const Color kRed = Color(0xFFE53935);
+  // ── Dynamic watch name (replaces hardcoded "Titan Smart Crest 2.0") ──
+  String _watchName = 'Smart Watch';
+
+  static const Color kGreen  = Color(0xFF78C841);
+  static const Color kRed    = Color(0xFFE53935);
   static const Color kOrange = Color(0xFFFFA726);
 
   @override
@@ -52,11 +55,21 @@ class _WatchScreenState extends State<WatchScreen>
 
   Future<void> _initWatch() async {
     await _watchService.initialize();
-    // FIX: Always show connected for Titan (uses notification mirroring)
-    setState(() => _isConnected = true);
+
+    // Fetch the real Bluetooth name from Android
+    final name = await _watchService.getWatchName();
+
+    if (mounted) {
+      setState(() {
+        _isConnected = true;
+        _watchName = name;
+        _isLoadingName = false;
+      });
+    }
 
     _commandSub = _watchService.watchCommands.listen((command) {
       if (command == 'START' || command == 'STOP') {
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -72,29 +85,36 @@ class _WatchScreenState extends State<WatchScreen>
     });
   }
 
-  // FIX: Connect button now shows Titan setup instructions
   Future<void> _handleConnectButton() async {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: Row(
           children: [
             Icon(Icons.watch, color: kGreen),
             const SizedBox(width: 8),
-            const Text('Titan Smart Setup'),
+            // ── Uses dynamic name in dialog title ──
+            Expanded(
+              child: Text(
+                '$_watchName Setup',
+                style: const TextStyle(fontSize: 16),
+              ),
+            ),
           ],
         ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Your Titan Smart Crest 2.0 receives alerts via notification mirroring.',
-              style: TextStyle(fontSize: 13, color: Colors.black87),
+            // ── Uses dynamic name in description ──
+            Text(
+              '$_watchName receives alerts via notification mirroring.',
+              style: const TextStyle(fontSize: 13, color: Colors.black87),
             ),
             const SizedBox(height: 12),
-            _buildStep('1', 'Open Titan Smart 2 app on your phone'),
+            _buildStep('1', 'Open the companion watch app on your phone'),
             _buildStep('2', 'Go to Notifications → App Notifications'),
             _buildStep('3', 'Find "Driver Safety Monitor" and toggle ON'),
             _buildStep('4', 'Make sure watch is paired via Bluetooth'),
@@ -128,7 +148,6 @@ class _WatchScreenState extends State<WatchScreen>
           ElevatedButton(
             onPressed: () async {
               Navigator.pop(context);
-              // Open notification settings
               await openAppSettings();
             },
             style: ElevatedButton.styleFrom(backgroundColor: kGreen),
@@ -166,7 +185,8 @@ class _WatchScreenState extends State<WatchScreen>
           const SizedBox(width: 8),
           Expanded(
             child: Text(text,
-                style: const TextStyle(fontSize: 12, color: Colors.black87)),
+                style:
+                    const TextStyle(fontSize: 12, color: Colors.black87)),
           ),
         ],
       ),
@@ -181,13 +201,14 @@ class _WatchScreenState extends State<WatchScreen>
       detectionCount: widget.detectionCount,
     );
     await Future.delayed(const Duration(milliseconds: 800));
-    setState(() => _isSending = false);
     if (mounted) {
+      setState(() => _isSending = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('✅ Test alert sent — check your Titan watch!'),
+        SnackBar(
+          // ── Uses dynamic name in snackbar too ──
+          content: Text('✅ Test alert sent — check your $_watchName!'),
           backgroundColor: kGreen,
-          duration: Duration(seconds: 3),
+          duration: const Duration(seconds: 3),
         ),
       );
     }
@@ -196,6 +217,7 @@ class _WatchScreenState extends State<WatchScreen>
   Future<void> _syncStatus() async {
     await _watchService.sendMonitoringStatus(isActive: widget.isMonitoring);
     await _watchService.sendHeartRate(_heartRate);
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text('✅ Status synced to watch'),
@@ -235,7 +257,7 @@ class _WatchScreenState extends State<WatchScreen>
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
 
-            // ── CONNECTION CARD ──────────────────────────────────────────
+            // ── CONNECTION CARD ────────────────────────────────────────
             _buildCard(
               child: Row(
                 children: [
@@ -256,13 +278,23 @@ class _WatchScreenState extends State<WatchScreen>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          'Titan Smart Crest 2.0',
-                          style: TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 16),
-                        ),
-                        const SizedBox(height: 2),
-                        // FIX: Show as connected via Bluetooth
+                        // ── Dynamic watch name with loading state ──
+                        _isLoadingName
+                            ? Container(
+                                width: 140,
+                                height: 16,
+                                decoration: BoxDecoration(
+                                  color: Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                              )
+                            : Text(
+                                _watchName,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16),
+                              ),
+                        const SizedBox(height: 4),
                         Row(
                           children: [
                             Icon(Icons.bluetooth_connected,
@@ -270,15 +302,14 @@ class _WatchScreenState extends State<WatchScreen>
                             const SizedBox(width: 4),
                             Text(
                               'Connected via Bluetooth',
-                              style:
-                              TextStyle(fontSize: 13, color: kGreen),
+                              style: TextStyle(
+                                  fontSize: 13, color: kGreen),
                             ),
                           ],
                         ),
                       ],
                     ),
                   ),
-                  // FIX: Button opens setup instructions
                   ElevatedButton.icon(
                     onPressed: _handleConnectButton,
                     icon: const Icon(Icons.settings, size: 16),
@@ -299,7 +330,7 @@ class _WatchScreenState extends State<WatchScreen>
 
             const SizedBox(height: 14),
 
-            // ── HOW ALERTS WORK BANNER ───────────────────────────────────
+            // ── HOW ALERTS WORK BANNER ─────────────────────────────────
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
@@ -309,12 +340,14 @@ class _WatchScreenState extends State<WatchScreen>
               ),
               child: Row(
                 children: [
-                  Icon(Icons.notifications_active, color: kGreen, size: 20),
+                  Icon(Icons.notifications_active,
+                      color: kGreen, size: 20),
                   const SizedBox(width: 10),
                   const Expanded(
                     child: Text(
                       'Alerts sent automatically via phone notifications → watch vibrates when drowsiness is detected',
-                      style: TextStyle(fontSize: 12, color: Color(0xFF555555)),
+                      style: TextStyle(
+                          fontSize: 12, color: Color(0xFF555555)),
                     ),
                   ),
                 ],
@@ -323,7 +356,7 @@ class _WatchScreenState extends State<WatchScreen>
 
             const SizedBox(height: 14),
 
-            // ── CURRENT STATUS CARD ──────────────────────────────────────
+            // ── CURRENT STATUS CARD ────────────────────────────────────
             _buildCard(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -345,7 +378,8 @@ class _WatchScreenState extends State<WatchScreen>
                             : Icons.visibility_off,
                         label: 'Monitoring',
                         value: widget.isMonitoring ? 'Active' : 'Inactive',
-                        color: widget.isMonitoring ? kGreen : Colors.grey,
+                        color:
+                            widget.isMonitoring ? kGreen : Colors.grey,
                       ),
                       const SizedBox(width: 10),
                       _buildStatusTile(
@@ -368,13 +402,11 @@ class _WatchScreenState extends State<WatchScreen>
                   const SizedBox(height: 12),
                   Row(
                     children: [
-                      _buildStatChip(
-                          'Detections', '${widget.detectionCount}', kOrange),
+                      _buildStatChip('Detections',
+                          '${widget.detectionCount}', kOrange),
                       const SizedBox(width: 10),
-                      _buildStatChip(
-                          'EAR Score',
-                          widget.earScore.toStringAsFixed(2),
-                          kGreen),
+                      _buildStatChip('EAR Score',
+                          widget.earScore.toStringAsFixed(2), kGreen),
                     ],
                   ),
                 ],
@@ -383,7 +415,7 @@ class _WatchScreenState extends State<WatchScreen>
 
             const SizedBox(height: 14),
 
-            // ── WATCH PREVIEW ────────────────────────────────────────────
+            // ── WATCH PREVIEW ──────────────────────────────────────────
             _buildCard(
               child: Column(
                 children: [
@@ -403,7 +435,7 @@ class _WatchScreenState extends State<WatchScreen>
 
             const SizedBox(height: 14),
 
-            // ── ACTION BUTTONS ───────────────────────────────────────────
+            // ── ACTION BUTTONS ─────────────────────────────────────────
             _buildCard(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -417,8 +449,6 @@ class _WatchScreenState extends State<WatchScreen>
                     ),
                   ),
                   const SizedBox(height: 14),
-
-                  // Sync Status Button — always enabled
                   ElevatedButton.icon(
                     onPressed: _syncStatus,
                     icon: const Icon(Icons.sync),
@@ -432,24 +462,22 @@ class _WatchScreenState extends State<WatchScreen>
                       ),
                     ),
                   ),
-
                   const SizedBox(height: 10),
-
-                  // Send Test Alert — always enabled
                   ElevatedButton.icon(
                     onPressed: !_isSending ? _sendTestAlert : null,
                     icon: _isSending
                         ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    )
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
                         : const Icon(Icons.notifications_active),
-                    label: Text(
-                        _isSending ? 'Sending...' : 'Send Test Alert to Watch'),
+                    label: Text(_isSending
+                        ? 'Sending...'
+                        : 'Send Test Alert to Watch'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: kOrange,
                       foregroundColor: Colors.white,
@@ -472,10 +500,10 @@ class _WatchScreenState extends State<WatchScreen>
   }
 
   Widget _buildWatchFacePreview() {
-    final color = widget.isDrowsy ? kRed : kGreen;
+    final color     = widget.isDrowsy ? kRed : kGreen;
     final statusText = widget.isDrowsy ? 'DROWSY!' : 'Normal';
     final icon =
-    widget.isDrowsy ? Icons.warning_amber_rounded : Icons.check_circle;
+        widget.isDrowsy ? Icons.warning_amber_rounded : Icons.check_circle;
 
     return Container(
       width: 160,
@@ -577,7 +605,8 @@ class _WatchScreenState extends State<WatchScreen>
   Widget _buildStatChip(String label, String value, Color color) {
     return Expanded(
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+        padding:
+            const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
         decoration: BoxDecoration(
           border: Border.all(color: color.withOpacity(0.4)),
           borderRadius: BorderRadius.circular(8),

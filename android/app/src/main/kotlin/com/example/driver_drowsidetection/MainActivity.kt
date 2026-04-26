@@ -16,7 +16,7 @@ import kotlinx.coroutines.*
 class MainActivity : FlutterActivity(), MessageClient.OnMessageReceivedListener {
 
     companion object {
-        private const val CHANNEL    = "com.driver_drowsidetection/drowsiness"
+        private const val CHANNEL     = "com.driver_drowsidetection/drowsiness"
         private const val PATH_ALERT  = "/drowsiness/alert"
         private const val PATH_STATUS = "/drowsiness/status"
         private const val PATH_HRV    = "/drowsiness/hrv"
@@ -42,6 +42,15 @@ class MainActivity : FlutterActivity(), MessageClient.OnMessageReceivedListener 
                     scope.launch {
                         val connected = isWatchConnected()
                         withContext(Dispatchers.Main) { result.success(connected) }
+                    }
+                }
+
+                // ── NEW: returns the display name of the paired watch node ──
+                "getWatchName" -> {
+                    scope.launch {
+                        val nodes = getConnectedNodes()
+                        val name  = nodes.firstOrNull()?.displayName ?: "Smart Watch"
+                        withContext(Dispatchers.Main) { result.success(name) }
                     }
                 }
 
